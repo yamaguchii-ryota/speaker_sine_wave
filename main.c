@@ -6,6 +6,7 @@
  * 概要:
  * dsPIC33FJ64GP802の内蔵16ビットDACを使用し、指定された周波数の正弦波を
  * 差動出力するプログラムです。
+ * このバージョンでは、出力振幅がフルスケールの1/3になるように調整されています。
  *
  * 機能仕様:
  * 1. 外部発振子: 20MHzのセラミック発振子を使用
@@ -110,7 +111,7 @@ void init_timer1(uint16_t period);
 
 int main(void) {
     // ★★★ 出力したい周波数をここで指定します (10.0 ~ 2000.0 Hz) ★★★
-    const float TARGET_FREQUENCY = 100.0f; // 例: 440Hz (A4:ラの音)
+    const float TARGET_FREQUENCY = 100.0f; // 例: 100Hz
 
     // 1. システムの初期化
     init_oscillator(); // 発振器（クロック）を40MIPSに設定
@@ -127,43 +128,6 @@ int main(void) {
 
     return 0; // ここには到達しない
 }
-
-/*
-// main関数を一時的に以下に置き換えてテストします
-int main(void) {
-    // システムを初期化
-    init_oscillator();
-    init_dac(); // 改善版のinit_dacを使用
-
-    // DACに固定値(DC)を出力して、ピンの電圧を直接測定します
-    // ★★★ 以下の3つのパターンを1つずつ試してください ★★★
-    // 期待値は AVDD = 3.3V の場合です
-
-    // --- パターン1: 最大値 ---
-    // 期待値: DAC1LP = 3.3V, DAC1LN = 0V
-//    DAC1LDAT = 0xFFFF; // 65535
-//    DAC1RDAT = 0xFFFF;
-
-    
-    // --- パターン2: 中間値 (ゼロ点) ---
-    // 期待値: DAC1LP = 1.65V, DAC1LN = 1.65V
-    DAC1LDAT = 0x8000; // 32768
-    DAC1RDAT = 0x8000;
-    
-
-    
-    // --- パターン3: 最小値 ---
-    // 期待値: DAC1LP = 0V, DAC1LN = 3.3V
-//    DAC1LDAT = 0x0000;
-//    DAC1RDAT = 0x0000;
-    
-
-    // 何もしないループ
-    while(1) {}
-    
-    return 0;
-}
-*/
 
 
 //==============================================================================
@@ -183,9 +147,9 @@ void init_oscillator(void) {
     // N1 = PLLPRE + 2 = 0 + 2 = 2
     // N2 = 2 * (PLLPOST + 1) = 2 * (0 + 1) = 2
     // M = PLLDIV + 2 = 14 + 2 = 16
-    PLLFBD = 14;             // M = 16
-    CLKDIVbits.PLLPRE = 0;   // N1 = 2
-    CLKDIVbits.PLLPOST = 0;  // N2 = 2
+    PLLFBD = 14;              // M = 16
+    CLKDIVbits.PLLPRE = 0;    // N1 = 2
+    CLKDIVbits.PLLPOST = 0;   // N2 = 2
 
     // 発振器の切り替えを初期化
     __builtin_write_OSCCONH(0x03); // 新しい発振器ソース = PRI + PLL
@@ -222,9 +186,9 @@ void init_dac(void) {
     DAC1STAT = 0; // ステータスフラグを全てクリア
 
     // DACの動作モードを設定します。
-    DAC1CONbits.FORM = 0;    // データ形式: 符号なし整数
-    DAC1CONbits.AMPON = 1;   // スリープ/アイドル中も出力アンプを有効化
-    DAC1CONbits.DACSIDL = 0; // アイドルモード中も動作を継続
+    DAC1CONbits.FORM = 0;     // データ形式: 符号なし整数
+    DAC1CONbits.AMPON = 1;    // スリープ/アイドル中も出力アンプを有効化
+    DAC1CONbits.DACSIDL = 0;  // アイドルモード中も動作を継続
 
     // --- ステップ 4: DACの有効化 ---
     // DACモジュール自体を有効にします。
@@ -261,9 +225,16 @@ void set_output_frequency(float freq_hz) {
     for (int i = 0; i < current_table_size; i++) {
         // sinf()の引数: 2 * PI * i / N (i番目のサンプルでの角度[rad])
         // sinf()の値域: -1.0 ~ 1.0
-        // 出力値: 32767.5 * (1 + sin) -> 0 ~ 65535 の16ビット符号なし整数
         float angle = (2.0f * M_PI * i) / current_table_size;
-        sine_table[i] = (uint16_t)(32767.5f * (1.0f + sinf(angle)));
+
+        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        // ★ 修正箇所: 振幅を1/3に調整 ★
+        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        // DCオフセット(中心値)は32767.5f (0x8000相当)
+        // 振幅はフルスケール(32767.5f)の1/3に設定
+        const float dc_offset = 32767.5f;
+        const float amplitude = 32767.5f / 5.0f;
+        sine_table[i] = (uint16_t)(dc_offset + amplitude * sinf(angle));
     }
 
     // 3. テーブルインデックスをリセット
@@ -280,21 +251,21 @@ void set_output_frequency(float freq_hz) {
  * @param period TMR1の周期を決めるPR1レジスタの値
  */
 void init_timer1(uint16_t period) {
-    T1CON = 0;              // タイマーを停止し、設定をリセット
-    TMR1 = 0;               // タイマーカウンターをリセット
-    PR1 = period;           // 周期を設定
+    T1CON = 0;               // タイマーを停止し、設定をリセット
+    TMR1 = 0;                // タイマーカウンターをリセット
+    PR1 = period;            // 周期を設定
 
     // T1CON設定
-    T1CONbits.TON = 1;      // タイマーを有効化
-    T1CONbits.TSIDL = 0;    // アイドル中も動作
-    T1CONbits.TGATE = 0;    // ゲートモード無効
-    T1CONbits.TCKPS = 0b00; // プリスケーラ 1:1
-    T1CONbits.TCS = 0;      // クロックソース: 内部クロック(FCY)
+    T1CONbits.TON = 1;       // タイマーを有効化
+    T1CONbits.TSIDL = 0;     // アイドル中も動作
+    T1CONbits.TGATE = 0;     // ゲートモード無効
+    T1CONbits.TCKPS = 0b00;  // プリスケーラ 1:1
+    T1CONbits.TCS = 0;       // クロックソース: 内部クロック(FCY)
 
     // 割り込み設定
-    IPC0bits.T1IP = 5;      // 割り込み優先度を5に設定 (1-7で任意)
-    IFS0bits.T1IF = 0;      // 割り込みフラグをクリア
-    IEC0bits.T1IE = 1;      // Timer1割り込みを有効化
+    IPC0bits.T1IP = 5;       // 割り込み優先度を5に設定 (1-7で任意)
+    IFS0bits.T1IF = 0;       // 割り込みフラグをクリア
+    IEC0bits.T1IE = 1;       // Timer1割り込みを有効化
 }
 
 
