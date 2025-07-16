@@ -5,8 +5,9 @@
  *
  * 概要:
  * dsPIC33FJ64GP802の内蔵16ビットDACを使用し、指定された周波数の正弦波を
- * 差動出力するプログラムです。
- * このバージョンでは、出力振幅がフルスケールの1/3になるように調整されています。
+ * 差動出力するプログラムです。DACのサンプリング周波数を固定の高い値に設定し、
+ * 正弦波テーブルのインデックスを浮動小数点数で進めることで、
+ * 高品質な波形を生成します。
  *
  * 機能仕様:
  * 1. 外部発振子: 20MHzのセラミック発振子を使用
@@ -16,9 +17,9 @@
  * - DAC1LP (Pin 25), DAC1LN (Pin 26)
  * - DAC1RP (Pin 23), DAC1RN (Pin 24)
  * 5. 正弦波生成:
- * - タイマ割り込みとDMAを利用せず、CPUによるテーブル参照方式を採用
- * - 出力周波数に応じて、正弦波の分解能（テーブルサイズ）を自動で調整し、
- * 低周波でも高周波でも滑らかな波形を維持
+ * - タイマ割り込みによるCPUでのテーブル参照方式を採用
+ * - 固定された高いサンプリング周波数で動作し、正弦波テーブルのインデックスを
+ * 浮動小数点数で進めることで、任意の出力周波数に対応し、滑らかな波形を維持
  *
  *****************************************************************************/
 
@@ -26,7 +27,8 @@
 // インクルードファイル
 //==============================================================================
 #include <xc.h>
-#include <math.h> // sinf()関数を使用するために必要
+#include <math.h>   // sinf()関数を使用するために必要
+#include <stdint.h> // uint16_tなどの型定義のために必要
 
 //==============================================================================
 // コンフィグレーションビット設定 (ご指定の通りに設定)
@@ -78,7 +80,9 @@
 
 // 正弦波テーブルの品質に関する定義
 #define MAX_SINE_TABLE_SIZE 1024 // 正弦波テーブルの最大サイズ（分解能）。メモリと品質のトレードオフ
-#define INITIAL_SAMPLING_FREQ 200000.0f // 目標とする初期サンプリング周波数 (Hz)
+// DACの固定サンプリング周波数 (Hz) - 高いほどノイズが可聴域外に追いやられ、波形が滑らかになる
+// 48kHzまたは96kHzを推奨。CPU負荷を考慮し、まずは48kHzから試すことを推奨。
+#define DAC_SAMPLING_FREQ 48000.0f // 48kHz
 
 // M_PIが未定義の場合があるため定義
 #ifndef M_PI
@@ -90,10 +94,12 @@
 //==============================================================================
 // 正弦波の波形データを格納するテーブル
 uint16_t sine_table[MAX_SINE_TABLE_SIZE];
-// 現在の正弦波テーブルのサイズ（分解能）
-volatile uint16_t current_table_size;
-// テーブルを参照するためのインデックス
-volatile uint16_t sine_table_index = 0;
+// 現在の正弦波テーブルのサイズ（分解能）- 固定サンプリング周波数方式では常にMAX_SINE_TABLE_SIZE
+volatile uint16_t current_table_size = MAX_SINE_TABLE_SIZE;
+// テーブルを参照するための浮動小数点インデックス (割り込みルーチン内で使用)
+volatile float sine_float_index = 0.0f;
+// 1サンプリングあたりのテーブルインデックスの増分 (浮動小数点)
+volatile float sine_index_step;
 
 
 //==============================================================================
@@ -147,7 +153,7 @@ void init_oscillator(void) {
     // N1 = PLLPRE + 2 = 0 + 2 = 2
     // N2 = 2 * (PLLPOST + 1) = 2 * (0 + 1) = 2
     // M = PLLDIV + 2 = 14 + 2 = 16
-    PLLFBD = 14;              // M = 16
+    PLLFBD = 14;      // M = 16
     CLKDIVbits.PLLPRE = 0;    // N1 = 2
     CLKDIVbits.PLLPOST = 0;   // N2 = 2
 
@@ -161,7 +167,7 @@ void init_oscillator(void) {
 }
 
 /**
- * @brief DAコンバータ初期化関数 (TRIS設定追加・最終版)
+ * @brief DAコンバータ初期化関数
  *
  * DACで使用するピンのTRISレジスタとAD1PCFGLレジスタを明示的に設定し、
  * 内蔵DAコンバータを差動出力モードで有効にします。
@@ -171,14 +177,15 @@ void init_dac(void) {
     // DACで使用するピン(RB12-RB15)を「入力」に設定します。
     // これによりデジタル出力ドライバが無効になり、DACがピンを制御できます。
     // TRISBレジスタのビット12, 13, 14, 15を1にセットします。
-    TRISB |= 0xF000;
+    TRISB |= 0xF000; // RB12, RB13, RB14, RB15 を入力に設定
 
     // --- ステップ 2: ピンのアナログ機能を設定 ---
     // ADCモジュールを無効化し、AD1PCFGLを安全に設定します。
     AD1CON1bits.ADON = 0;
     // DACで使用するピン(AN9-AN12)を「アナログ」モードに設定します。
     // これが最も重要な設定です。
-    AD1PCFGL &= 0xE1FF; // AN9, AN10, AN11, AN12 をアナログに設定
+    // AN9 (RB12), AN10 (RB13), AN11 (RB14), AN12 (RB15) をアナログに設定
+    AD1PCFGL &= 0xE1FF; // 0b1110000111111111; AN9, AN10, AN11, AN12 をアナログに設定
 
     // --- ステップ 3: DACモジュールの設定 ---
     // 設定前にDACを無効化します。
@@ -186,9 +193,9 @@ void init_dac(void) {
     DAC1STAT = 0; // ステータスフラグを全てクリア
 
     // DACの動作モードを設定します。
-    DAC1CONbits.FORM = 0;     // データ形式: 符号なし整数
-    DAC1CONbits.AMPON = 1;    // スリープ/アイドル中も出力アンプを有効化
-    DAC1CONbits.DACSIDL = 0;  // アイドルモード中も動作を継続
+    DAC1CONbits.FORM = 0;    // データ形式: 符号なし整数 (0x0000 - 0xFFFF)
+    DAC1CONbits.AMPON = 1;   // スリープ/アイドル中も出力アンプを有効化
+    DAC1CONbits.DACSIDL = 0; // アイドルモード中も動作を継続
 
     // --- ステップ 4: DACの有効化 ---
     // DACモジュール自体を有効にします。
@@ -199,50 +206,53 @@ void init_dac(void) {
     for (volatile int i = 0; i < 600; i++);
 
     // 安定後、左右両チャンネルの出力を有効にします。
-    DAC1STATbits.LOEN = 1;
-    DAC1STATbits.ROEN = 1;
+    DAC1STATbits.LOEN = 1; // 左チャンネル出力有効
+    DAC1STATbits.ROEN = 1; // 右チャンネル出力有効
 }
-
-
 
 /**
  * @brief 指定された周波数で正弦波を生成するための設定を行います。
  *
- * 周波数に応じて最適なテーブルサイズ（分解能）とサンプリング周波数を計算し、
- * 正弦波テーブルを生成後、タイマーを設定して出力を開始します。
+ * DACのサンプリング周波数を固定の高い値に設定し、
+ * 正弦波テーブルのインデックスを浮動小数点数で進めることで、
+ * 任意の出力周波数に対応し、滑らかな波形を維持します。
  * @param freq_hz 出力したい周波数 (Hz)
  */
 void set_output_frequency(float freq_hz) {
     // 割り込みを一時的に停止して設定を変更
     IEC0bits.T1IE = 0;
 
-    // 常に1周期を200個の点で表現する
-    current_table_size = 200;
-    // 必要なサンプリング周波数を計算
-    float sampling_freq = freq_hz * current_table_size;
+    // 正弦波テーブルのサイズは常にMAX_SINE_TABLE_SIZEに固定
+    // current_table_size = MAX_SINE_TABLE_SIZE; // グローバル変数で初期化済み
+
+    // 1サンプリングあたりのテーブルインデックスの増分を計算
+    // 例: 100Hzの正弦波を48kHzサンプリング、1024点のテーブルで生成する場合
+    // sine_index_step = 1024 * 100 / 48000 = 2.1333...
+    sine_index_step = (float)current_table_size * freq_hz / DAC_SAMPLING_FREQ;
 
     // 2. 正弦波テーブルを生成
     for (int i = 0; i < current_table_size; i++) {
         // sinf()の引数: 2 * PI * i / N (i番目のサンプルでの角度[rad])
         // sinf()の値域: -1.0 ~ 1.0
+        // 出力値: 32767.5 * (1 + sin) -> 0 ~ 65535 の16ビット符号なし整数
         float angle = (2.0f * M_PI * i) / current_table_size;
-
-        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        // ★ 修正箇所: 振幅を1/3に調整 ★
-        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        
         // DCオフセット(中心値)は32767.5f (0x8000相当)
         // 振幅はフルスケール(32767.5f)の1/3に設定
+        // ※ DACの基準電圧と後段アンプの入力感度に合わせて調整してください。
+        // 例: DAC電源電圧が3.3Vで、180mVp-pの出力が欲しい場合
+        // const float amplitude = (0.18f / 3.3f) * 32767.5f;
         const float dc_offset = 32767.5f;
-        const float amplitude = 32767.5f / 5.0f;
+        const float amplitude = 32767.5f / 3.0f; // 現在のプログラムの値を維持
         sine_table[i] = (uint16_t)(dc_offset + amplitude * sinf(angle));
     }
 
-    // 3. テーブルインデックスをリセット
-    sine_table_index = 0;
+    // 3. 浮動小数点インデックスをリセット
+    sine_float_index = 0.0f;
 
-    // 4. 新しいサンプリング周波数でタイマーを初期化
-    // PR1 = (FCY / sampling_freq) - 1;
-    uint16_t period = (uint16_t)(FCY / sampling_freq) - 1;
+    // 4. 固定サンプリング周波数でタイマーを初期化
+    // PR1 = (FCY / DAC_SAMPLING_FREQ) - 1;
+    uint16_t period = (uint16_t)(FCY / DAC_SAMPLING_FREQ) - 1;
     init_timer1(period);
 }
 
@@ -251,21 +261,21 @@ void set_output_frequency(float freq_hz) {
  * @param period TMR1の周期を決めるPR1レジスタの値
  */
 void init_timer1(uint16_t period) {
-    T1CON = 0;               // タイマーを停止し、設定をリセット
-    TMR1 = 0;                // タイマーカウンターをリセット
-    PR1 = period;            // 周期を設定
+    T1CON = 0;          // タイマーを停止し、設定をリセット
+    TMR1 = 0;           // タイマーカウンターをリセット
+    PR1 = period;       // 周期を設定
 
     // T1CON設定
-    T1CONbits.TON = 1;       // タイマーを有効化
-    T1CONbits.TSIDL = 0;     // アイドル中も動作
-    T1CONbits.TGATE = 0;     // ゲートモード無効
-    T1CONbits.TCKPS = 0b00;  // プリスケーラ 1:1
-    T1CONbits.TCS = 0;       // クロックソース: 内部クロック(FCY)
+    T1CONbits.TON = 1;      // タイマーを有効化
+    T1CONbits.TSIDL = 0;    // アイドル中も動作
+    T1CONbits.TGATE = 0;    // ゲートモード無効
+    T1CONbits.TCKPS = 0b00; // プリスケーラ 1:1
+    T1CONbits.TCS = 0;      // クロックソース: 内部クロック(FCY)
 
     // 割り込み設定
-    IPC0bits.T1IP = 5;       // 割り込み優先度を5に設定 (1-7で任意)
-    IFS0bits.T1IF = 0;       // 割り込みフラグをクリア
-    IEC0bits.T1IE = 1;       // Timer1割り込みを有効化
+    IPC0bits.T1IP = 5;      // 割り込み優先度を5に設定 (1-7で任意)
+    IFS0bits.T1IF = 0;      // 割り込みフラグをクリア
+    IEC0bits.T1IE = 1;      // Timer1割り込みを有効化
 }
 
 
@@ -278,21 +288,24 @@ void init_timer1(uint16_t period) {
  *
  * 一定周期（サンプリング周期）で呼び出され、正弦波テーブルの次の値を
  * DAコンバータに出力します。
+ * ※ 割り込みルーチンでの浮動小数点演算はCPU負荷が高いため、
+ * 可能であればDMAの使用や固定小数点演算への移行を検討してください。
  */
 void __attribute__((__interrupt__, no_auto_psv)) _T1Interrupt(void) {
-    // 1. テーブルから現在の波形データを取得
-    uint16_t dac_value = sine_table[sine_table_index];
+    // 1. テーブルから現在の波形データを取得 (浮動小数点インデックスの整数部を使用)
+    uint16_t dac_value = sine_table[(uint16_t)sine_float_index];
 
     // 2. DACの左右両チャンネルに同じデータを出力
     DAC1LDAT = dac_value;
     DAC1RDAT = dac_value;
 
-    // 3. 次のデータを参照するためにインデックスを更新
-    sine_table_index++;
+    // 3. 次のデータを参照するために浮動小数点インデックスを更新
+    sine_float_index += sine_index_step;
 
     // 4. インデックスがテーブルの終端に達したら先頭に戻す（ループ）
-    if (sine_table_index >= current_table_size) {
-        sine_table_index = 0;
+    // ※ 剰余演算 (%) はCPU負荷が高いので、減算でループ処理を行います。
+    if (sine_float_index >= current_table_size) {
+        sine_float_index -= current_table_size;
     }
 
     // 5. Timer1の割り込みフラグをクリア
